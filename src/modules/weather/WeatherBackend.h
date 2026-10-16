@@ -46,6 +46,34 @@ class WeatherBackend : public QObject {
     // Nothing binds it yet; it exists so an on-screen indicator is a QML-only
     // change.
     Q_PROPERTY(bool musicPlaying READ musicPlaying NOTIFY musicStateChanged)
+    // Animated radar loop (RainViewer's public API, no key). One entry per
+    // available frame, each a row-major grid of tile URLs (radarGridColumns
+    // wide, north row first). The location's own tile is the middle column of
+    // row radarCenterRow. See buildRadarLoop().
+    Q_PROPERTY(QVariantList radarFrames READ radarFrames NOTIFY dataChanged)
+    Q_PROPERTY(bool hasRadar READ hasRadar NOTIFY dataChanged)
+    // Resolved location's position within that tile, 0..1 on each axis, so the
+    // screen can drop a "you are here" marker at the exact spot.
+    Q_PROPERTY(double radarMarkerX READ radarMarkerX NOTIFY dataChanged)
+    Q_PROPERTY(double radarMarkerY READ radarMarkerY NOTIFY dataChanged)
+    // The tile's own XYZ coordinates and pixel size, so the screen can project
+    // its bundled coastline/border lines (lon/lat) into the same tile-local
+    // space markerX/markerY already use, without duplicating this math in QML.
+    Q_PROPERTY(int radarTileX READ radarTileX NOTIFY dataChanged)
+    Q_PROPERTY(int radarTileY READ radarTileY NOTIFY dataChanged)
+    // Zoom of the loop currently published (it changes together with the
+    // frames and tile x/y, so lines and tiles never disagree mid-switch), and
+    // the zoom asked for with zoomRadar(); they differ while a new zoom's
+    // tiles are still downloading.
+    Q_PROPERTY(int radarZoom READ radarZoom NOTIFY dataChanged)
+    Q_PROPERTY(int radarRequestedZoom READ radarRequestedZoom NOTIFY radarRequestedZoomChanged)
+    Q_PROPERTY(int radarTileSourcePx READ radarTileSourcePx CONSTANT)
+    Q_PROPERTY(int radarGridColumns READ radarGridColumns CONSTANT)
+    Q_PROPERTY(int radarCenterRow READ radarCenterRow NOTIFY dataChanged)
+    // Cloud cover under the rain, laid out exactly like radarFrames (same frame
+    // index matched by time, same columns), but local file URLs; "" where a
+    // tile failed. See buildRadarLoop().
+    Q_PROPERTY(QVariantList cloudFrames READ cloudFrames NOTIFY dataChanged)
 
 public:
     explicit WeatherBackend(const QString &appRoot, const QString &dataRoot,
@@ -61,6 +89,18 @@ public:
     QString tempUnitLabel() const;
     bool        hasData()          const { return m_hasData; }
     int         utcOffsetSeconds() const { return m_utcOffset; }
+    QVariantList radarFrames() const { return m_radarFrames; }
+    bool   hasRadar()    const { return !m_radarFrames.isEmpty(); }
+    double radarMarkerX() const { return m_radarMarkerX; }
+    double radarMarkerY() const { return m_radarMarkerY; }
+    int    radarTileX() const { return m_radarTileX; }
+    int    radarTileY() const { return m_radarTileY; }
+    int    radarZoom() const { return m_radarZoom; }
+    int    radarRequestedZoom() const { return m_radarRequestedZoom; }
+    int    radarTileSourcePx() const;
+    int    radarGridColumns() const;
+    int    radarCenterRow() const { return m_radarCenterRow; }
+    QVariantList cloudFrames() const { return m_cloudFrames; }
 
     bool musicPlaying() const;
 
@@ -74,6 +114,10 @@ public:
     // Resolve the location (if not already) and fetch, then keep refreshing
     // until stop(). Answers with dataChanged() or locationError().
     Q_INVOKABLE void start();
+    // Steps the radar zoom (+1 in, -1 out) within the supported range and
+    // rebuilds the loop at the new zoom. Returns the zoom now requested, for
+    // the view to save as the radar_zoom setting.
+    Q_INVOKABLE int zoomRadar(int step);
     Q_INVOKABLE void stop();
 
     // Background music, as a plain mpv subprocess — no video, no screen takeover.
@@ -90,6 +134,7 @@ public:
     Q_INVOKABLE void getDisplays();
 
 signals:
+    void radarRequestedZoomChanged();
     void dataChanged();
     void musicStateChanged();
     // reason ∈ {missing, unreadable, empty, notfound, network}
@@ -121,6 +166,16 @@ private:
     void resolveOthers(const QStringList &lines);
     void fetchOthers();
     void fetchWeather();
+    // RainViewer's public radar-frame list, no API key. Non-fatal on failure —
+    // radar just drops out of the display ring like an empty Other Locations.
+    void fetchRadar();
+    // Downloads every radar tile plus the GOES-East infrared satellite tiles
+    // (NASA GIBS, no key) for the same tiles and timestamps, the latter turned
+    // into a transparent cloud overlay, then publishes both loops at once.
+    // Cloud failures are non-fatal: the loop just runs without them.
+    void buildRadarLoop(const QString &host, const QStringList &paths,
+                        const QList<qint64> &frameTimes, int zoom,
+                        quint64 requestGeneration);
 
     // Station observations (US only). Resolved once per location, then polled
     // alongside fetchWeather(). Every failure here is non-fatal: the module
@@ -164,6 +219,7 @@ private:
     // that finish out of order cannot overwrite the newest snapshot.
     quint64 m_weatherRequestGeneration = 0;
     quint64 m_otherRequestGeneration = 0;
+    quint64 m_radarRequestGeneration = 0;
 
     // Resolved location, cached for the life of the process. Deliberately not
     // persisted: the project writes config.json only on direct user
@@ -210,6 +266,20 @@ private:
     QTimer       *m_musicConnect = nullptr;
     QString       m_musicSocketPath;
     bool          m_musicPaused = false;
+
+    // One tile URL per available frame (oldest first), plus where the resolved
+    // location falls within that tile (0..1 on each axis). Empty until the
+    // first successful fetchRadar().
+    QVariantList m_radarFrames;
+    double      m_radarMarkerX = 0.5;
+    double      m_radarMarkerY = 0.5;
+    int         m_radarTileX = 0;
+    int         m_radarTileY = 0;
+    int         m_radarZoom = 6;
+    int         m_radarCenterRow = 0;
+    int         m_radarRequestedZoom = 6;
+    bool        m_radarZoomLoaded = false;
+    QVariantList m_cloudFrames;
 
     QVariantMap  m_current;
     QVariantList m_forecast;

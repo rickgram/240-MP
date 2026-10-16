@@ -1,4 +1,5 @@
 #include "WeatherBackend.h"
+#include "RadarPalette.h"
 #include "../../util/MpvLocator.h"
 
 #include <QDir>
@@ -17,10 +18,15 @@
 #include <QDate>
 #include <QDateTime>
 #include <QHash>
+#include <QImage>
+#include <QRegularExpression>
 #include <QLocale>
 #include <QTimeZone>
 #include <QtMath>
 #include <QDebug>
+#include <algorithm>
+#include <cmath>
+#include <memory>
 
 namespace {
 
@@ -28,6 +34,141 @@ const char *kModuleId   = "com.240mp.weather";
 const char *kForecastUrl = "https://api.open-meteo.com/v1/forecast";
 const char *kGeocodeUrl  = "https://geocoding-api.open-meteo.com/v1/search";
 const char *kNwsPointsUrl = "https://api.weather.gov/points";
+
+// RainViewer's public radar-frame list — free, no API key, ~1200 radars
+// worldwide, refreshed every 10 minutes. No formal SLA (see their API docs),
+// hence fetchRadar() treating any failure as non-fatal.
+const char *kRadarMapsUrl = "https://api.rainviewer.com/public/weather-maps.json";
+// Single tile at this zoom (RainViewer's max is 7) covers a wide-enough region
+// to see weather approaching without stitching a mosaic — a many-tile grid
+// would multiply the request count by the frame count for little benefit on a
+// CRT-scale display. "2" is RainViewer's "Universal Blue" colour scheme.
+// Default zoom, and the range up/down on the radar screen can step through.
+// RainViewer serves 512px tiles up to zoom 7 (8 answers with a placeholder),
+// so zoom 8 crops and upscales the zoom-7 parent tile, the same trick the
+// clouds use past kCloudMaxZoom. A zoom-7 512px tile is already finer than
+// the radar data itself, so the upscale costs little.
+constexpr int kRadarDefaultZoom = 6;
+constexpr int kRadarMinZoom = 3;
+constexpr int kRadarMaxZoom = 8;
+constexpr int kRadarSourceMaxZoom = 7;
+constexpr int kRadarTileSize = 512;
+const char *kRadarColorScheme = "2";
+// Smoothing off so every pixel is an exact entry of the color table (smoothed
+// tiles blend colors that no longer decode); snow in its own colors on.
+const char *kRadarTileOptions = "0_1";
+// Tiles fetched per frame, side by side west to east around the location's own
+// tile, so the screen can show a map wider than it is tall. Three always covers
+// a box up to twice as wide as tall wherever the location sits in its tile.
+constexpr int kMapColumns = 3;
+// Rows likewise: the location's own tile row plus whichever neighbour row is
+// nearer the location, which is always enough to center the location
+// vertically in a box one tile tall.
+constexpr int kMapRows = 2;
+
+// Tile x for column `col` (0..kMapColumns-1) around center tile x, wrapping at
+// the antimeridian.
+int columnTileX(int centerX, int col, int zoom) {
+    const int n = 1 << zoom;
+    return ((centerX + col - kMapColumns / 2) % n + n) % n;
+}
+
+// Cloud cover: GOES-East ABI band 13 ("clean" longwave infrared) from NASA
+// GIBS, free and keyless, a new frame every 10 minutes, day and night alike
+// (a visible-light band would go black after sunset). Served as Web Mercator
+// XYZ tiles at the same zoom as the radar, so the same tile x/y covers the
+// same ground. kCloudDomainsUrl answers which times exist, so frames are only
+// ever requested for timestamps GIBS actually has. GIBS stops at zoom 6
+// (kCloudMaxZoom); deeper radar zooms crop and upscale the zoom-6 parent tile,
+// which is about the satellite's own ~2km resolution anyway.
+const char *kCloudLayer = "GOES-East_ABI_Band13_Clean_Infrared";
+const char *kCloudTileUrl =
+    "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/%1/default/%2/GoogleMapsCompatible_Level6/%3/%4/%5.png";
+const char *kCloudDomainsUrl =
+    "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/1.0.0/%1/default/GoogleMapsCompatible_Level6/all/%2--%3.xml";
+constexpr qint64 kCloudStepSecs = 600;
+constexpr int    kCloudMaxZoom = 6;
+// The tiles are opaque grayscale, brighter = colder. Warm, clear ground and sea
+// land around gray 85-110, cloud tops above ~120 (measured off live tiles over
+// the US east coast). Gray is ramped to alpha between these two, so clear
+// ground drops out entirely and the map lines show through it.
+constexpr int    kCloudGrayClear = 115;
+constexpr int    kCloudGrayFull  = 195;
+constexpr double kCloudMaxAlpha  = 0.85;
+
+// RainViewer's free API only serves its "Universal Blue" scheme (other color
+// IDs come back byte-identical), whose rain and snow blues look alike and
+// whose drizzle is tan. Each pixel is decoded back to rain/snow + dBZ through
+// the published table (RadarPalette.h) and repainted: rain in the standard
+// NWS reflectivity colors (MetPy's NWSReflectivity table), snow in its own
+// pale-to-deep blue scale so it never reads as rain.
+struct RadarStep { int dbz; QRgb color; };
+const RadarStep kNwsRain[] = {
+    {10, qRgba(0x02, 0xfd, 0x02, 140)},   // very light: faded green
+    {20, qRgb(0x02, 0xfd, 0x02)}, {25, qRgb(0x01, 0xc5, 0x01)}, {30, qRgb(0x00, 0x8e, 0x00)},
+    {35, qRgb(0xfd, 0xf8, 0x02)}, {40, qRgb(0xe5, 0xbc, 0x00)}, {45, qRgb(0xfd, 0x95, 0x00)},
+    {50, qRgb(0xfd, 0x00, 0x00)}, {55, qRgb(0xd4, 0x00, 0x00)}, {60, qRgb(0xbc, 0x00, 0x00)},
+    {65, qRgb(0xf8, 0x00, 0xfd)}, {70, qRgb(0x98, 0x54, 0xc6)}, {75, qRgb(0xfd, 0xfd, 0xfd)},
+};
+const RadarStep kSnow[] = {
+    {5,  qRgba(0xd6, 0xec, 0xff, 170)},   // flurries
+    {15, qRgb(0xa8, 0xd4, 0xff)}, {20, qRgb(0x7a, 0xb8, 0xff)}, {25, qRgb(0x4f, 0x9a, 0xff)},
+    {30, qRgb(0x2f, 0x78, 0xf0)}, {35, qRgb(0x1c, 0x55, 0xd6)},
+};
+
+template <size_t N>
+QRgb radarStepColor(const RadarStep (&steps)[N], int dbz) {
+    QRgb c = 0;   // below the first step: transparent (drizzle, noise)
+    for (const RadarStep &s : steps)
+        if (dbz >= s.dbz) c = s.color;
+    return c;
+}
+
+QImage recolorRadar(const QImage &tile) {
+    // Universal Blue color -> repainted color, built once.
+    static const QHash<QRgb, QRgb> lookup = [] {
+        QHash<QRgb, QRgb> map;
+        const auto add = [&map](const uint32_t *table, bool snow) {
+            for (int i = 0; i < kRadarPaletteSize; ++i) {
+                const uint32_t v = table[i];
+                if ((v & 0xff) == 0) continue;   // fully transparent
+                const QRgb key = qRgba(v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff);
+                const int dbz = kRadarPaletteFirstDbz + i;
+                if (!map.contains(key))
+                    map.insert(key, snow ? radarStepColor(kSnow, dbz) : radarStepColor(kNwsRain, dbz));
+            }
+        };
+        add(kUniversalBlueRain, false);
+        add(kUniversalBlueSnow, true);
+        return map;
+    }();
+
+    const QImage src = tile.convertToFormat(QImage::Format_ARGB32);
+    QImage out(src.size(), QImage::Format_ARGB32);
+    for (int y = 0; y < src.height(); ++y) {
+        const QRgb *in = reinterpret_cast<const QRgb *>(src.constScanLine(y));
+        QRgb *o = reinterpret_cast<QRgb *>(out.scanLine(y));
+        for (int x = 0; x < src.width(); ++x)
+            o[x] = qAlpha(in[x]) == 0 ? 0 : lookup.value(in[x], 0);
+    }
+    return out;
+}
+
+// Brightness temperature (as gray) to a white overlay with matching alpha.
+QImage cloudOverlayFromInfrared(const QImage &infrared) {
+    const QImage src = infrared.convertToFormat(QImage::Format_ARGB32);
+    QImage out(src.size(), QImage::Format_ARGB32);
+    for (int y = 0; y < src.height(); ++y) {
+        const QRgb *in = reinterpret_cast<const QRgb *>(src.constScanLine(y));
+        QRgb *o = reinterpret_cast<QRgb *>(out.scanLine(y));
+        for (int x = 0; x < src.width(); ++x) {
+            const double t = qBound(0.0, double(qGray(in[x]) - kCloudGrayClear)
+                                             / (kCloudGrayFull - kCloudGrayClear), 1.0);
+            o[x] = qRgba(255, 255, 255, int(255 * kCloudMaxAlpha * t));
+        }
+    }
+    return out;
+}
 
 // api.weather.gov answers 403 to requests without a User-Agent, and asks for
 // contact information in it. Qt sends none by default.
@@ -447,6 +588,7 @@ WeatherBackend::WeatherBackend(const QString &appRoot, const QString &dataRoot,
         fetchOthers();
         fetchObservation();
         fetchOtherObservations();
+        fetchRadar();
     });
 
     // Its own socket name: MpvController uses /240mp-mpv.sock for the player,
@@ -507,6 +649,7 @@ void WeatherBackend::getDisplays() {
         QVariantMap{ { "id", "extended" }, { "label", "EXTENDED FORECAST"  } },
         QVariantMap{ { "id", "others"   }, { "label", "OTHER LOCATIONS"    } },
         QVariantMap{ { "id", "almanac"  }, { "label", "ALMANAC"            } },
+        QVariantMap{ { "id", "radar"    }, { "label", "RADAR"              } },
     });
 }
 
@@ -517,6 +660,14 @@ void WeatherBackend::emitError(const QString &reason) {
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 void WeatherBackend::start() {
+    // The saved zoom, once per process; after that zoomRadar() owns it.
+    if (!m_radarZoomLoaded) {
+        m_radarZoomLoaded = true;
+        const int saved = moduleConfig()["radar_zoom"].toVariant().toInt();
+        m_radarRequestedZoom = saved >= kRadarMinZoom && saved <= kRadarMaxZoom
+                                   ? saved : kRadarDefaultZoom;
+        m_radarZoom = m_radarRequestedZoom;
+    }
     if (m_resolved) {
         // Already resolved from an earlier visit: refresh both requests. Only
         // fetching the primary here left Other Locations showing whatever units
@@ -525,6 +676,7 @@ void WeatherBackend::start() {
         fetchOthers();
         fetchObservation();
         fetchOtherObservations();
+        fetchRadar();
         m_refresh->start();
         return;
     }
@@ -739,6 +891,7 @@ void WeatherBackend::resolveLocation() {
               qPrintable(m_locationName), m_lat, m_lon);
         fetchWeather();
         resolveStations();
+        fetchRadar();
         m_refresh->start();
         resolveOthers(others);
         return;
@@ -756,6 +909,7 @@ void WeatherBackend::resolveLocation() {
               qPrintable(primary), qPrintable(m_locationName), m_lat, m_lon);
         fetchWeather();
         resolveStations();
+        fetchRadar();
         m_refresh->start();
         resolveOthers(others);
     });
@@ -962,6 +1116,290 @@ void WeatherBackend::fetchWeather() {
         emit dataChanged();
     });
 }
+
+// Web Mercator tile containing (lat, lon) at the given zoom, plus where within
+// that tile the point falls (0..1 on each axis) — the standard slippy-map tile
+// formula (see the OSM wiki's "Slippy map tilenames"), kept local since this
+// is the only place in the app that needs it.
+namespace {
+void latLonToTile(double lat, double lon, int zoom, int *tileX, int *tileY,
+                   double *fracX, double *fracY) {
+    const double n = std::pow(2.0, zoom);
+    const double latRad = qDegreesToRadians(lat);
+    const double xf = (lon + 180.0) / 360.0 * n;
+    const double yf = (1.0 - std::log(std::tan(latRad) + 1.0 / std::cos(latRad)) / M_PI)
+                       / 2.0 * n;
+    *tileX = static_cast<int>(std::floor(xf));
+    *tileY = static_cast<int>(std::floor(yf));
+    *fracX = xf - *tileX;
+    *fracY = yf - *tileY;
+}
+}
+
+int WeatherBackend::zoomRadar(int step) {
+    const int zoom = qBound(kRadarMinZoom, m_radarRequestedZoom + step, kRadarMaxZoom);
+    if (zoom != m_radarRequestedZoom) {
+        m_radarRequestedZoom = zoom;
+        emit radarRequestedZoomChanged();
+        // The loop on screen stays up until the new zoom's tiles are all on
+        // disk; buildRadarLoop publishes zoom, tile and frames together.
+        fetchRadar();
+    }
+    return m_radarRequestedZoom;
+}
+
+void WeatherBackend::fetchRadar() {
+    if (!m_resolved) return;
+    const quint64 requestGeneration = ++m_radarRequestGeneration;
+    const int zoom = m_radarRequestedZoom;
+
+    QNetworkReply *reply = m_nam->get(QNetworkRequest(QUrl(QString::fromLatin1(kRadarMapsUrl))));
+    connect(reply, &QNetworkReply::finished, this, [this, reply, requestGeneration, zoom]() {
+        reply->deleteLater();
+        if (requestGeneration != m_radarRequestGeneration) return;
+        if (reply->error() != QNetworkReply::NoError) {
+            // Non-fatal: no formal SLA on this free endpoint (see kRadarMapsUrl's
+            // comment). Radar just drops out of the display ring like an empty
+            // Other Locations, rather than taking the rest of the module down.
+            qWarning("[Weather] radar fetch failed: %s", qPrintable(reply->errorString()));
+            return;
+        }
+
+        const QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+        const QString host = root["host"].toString();
+        const QJsonArray past = root["radar"].toObject()["past"].toArray();
+        if (host.isEmpty() || past.isEmpty()) return;
+
+        QStringList paths;
+        QList<qint64> times;
+        for (const QJsonValue &v : past) {
+            const QString path = v.toObject()["path"].toString();
+            if (path.isEmpty()) continue;
+            paths << path;
+            times << static_cast<qint64>(v.toObject()["time"].toDouble());
+        }
+        if (!paths.isEmpty())
+            buildRadarLoop(host, paths, times, zoom, requestGeneration);
+    });
+}
+
+void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &paths,
+                                    const QList<qint64> &frameTimes, int zoom,
+                                    quint64 requestGeneration) {
+    int tileX = 0, tileY = 0;
+    double markerX = 0.5, markerY = 0.5;
+    latLonToTile(m_lat, m_lon, zoom, &tileX, &tileY, &markerX, &markerY);
+
+    // Every tile, radar and cloud, is downloaded to disk before the loop is
+    // published, and both lists are published together. Handing QML remote
+    // radar URLs next to local cloud files meant the radar half of each frame
+    // was still loading (or re-downloading, once Qt's pixmap cache evicted the
+    // 39 tiles) while the clouds were already up, so the two drifted apart.
+    // On disk, a refresh also only downloads what's new since the last one.
+    // Lives in the data directory, like every other file this app writes;
+    // anything older than the sweep below is deleted, so it stays small.
+    const QString cacheDir = m_dataRoot + QStringLiteral("/weather_radar_cache");
+    QDir().mkpath(cacheDir);
+    const QDateTime staleBefore = QDateTime::currentDateTimeUtc().addSecs(-6 * 3600);
+    for (const QFileInfo &fi : QDir(cacheDir).entryInfoList(QDir::Files))
+        if (fi.lastModified().toUTC() < staleBefore)
+            QFile::remove(fi.absoluteFilePath());
+
+    const auto iso = [](qint64 secs) {
+        return QDateTime::fromSecsSinceEpoch(secs, QTimeZone::UTC).toString(Qt::ISODate);
+    };
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const QUrl domainsUrl(QString::fromLatin1(kCloudDomainsUrl)
+                              .arg(QString::fromLatin1(kCloudLayer),
+                                   iso(frameTimes.first() - 3 * 3600), iso(now + 3600)));
+
+    QNetworkReply *reply = m_nam->get(QNetworkRequest(domainsUrl));
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, host, paths, frameTimes, zoom, tileX, tileY, markerX, markerY,
+             requestGeneration, cacheDir, iso]() {
+        reply->deleteLater();
+        if (requestGeneration != m_radarRequestGeneration) return;
+
+        // <Domain>start/end/PT10M</Domain>, possibly several comma-separated
+        // ranges if GIBS has a gap; the end of the last one is the newest frame.
+        // Any failure here just means a radar loop without clouds.
+        qint64 newestSecs = -1;
+        if (reply->error() == QNetworkReply::NoError) {
+            const QRegularExpressionMatch m =
+                QRegularExpression(QStringLiteral("<Domain>([^<]+)</Domain>"))
+                    .match(QString::fromUtf8(reply->readAll()));
+            if (m.hasMatch()) {
+                const QStringList range =
+                    m.captured(1).split(QLatin1Char(',')).last().split(QLatin1Char('/'));
+                const QDateTime newest = QDateTime::fromString(range.value(1), Qt::ISODate);
+                if (newest.isValid()) newestSecs = newest.toSecsSinceEpoch();
+            }
+        } else {
+            qWarning("[Weather] cloud time list failed: %s", qPrintable(reply->errorString()));
+        }
+
+        // GIBS runs ~20-40 min behind RainViewer. Radar frames newer than the
+        // newest satellite frame are dropped from the loop rather than paired
+        // with a stale cloud frame, which read as the clouds freezing while
+        // the rain kept moving. Every remaining frame gets the satellite frame
+        // for its own 10-minute slot.
+        int keep = frameTimes.size();
+        if (newestSecs >= 0) {
+            keep = 0;
+            while (keep < frameTimes.size()
+                   && frameTimes[keep] - frameTimes[keep] % kCloudStepSecs <= newestSecs)
+                ++keep;
+            if (keep == 0) {           // no overlap at all: radar alone
+                keep = frameTimes.size();
+                newestSecs = -1;
+            }
+        }
+        const bool withClouds = newestSecs >= 0;
+
+        // Cloud tiles come from zoom <= kCloudMaxZoom; deeper, from the parent
+        // tile at kCloudMaxZoom, cropped to this tile's share of it.
+        const int cloudZoom = qMin(zoom, kCloudMaxZoom);
+        const int cloudShift = zoom - cloudZoom;
+        const int radarZoom = qMin(zoom, kRadarSourceMaxZoom);
+        const int radarShift = zoom - radarZoom;
+        // cropDiv: tiles per parent side (1 = use the tile as-is); cropX/Y:
+        // this tile's position within its parent.
+        struct Job { QUrl url; QString path; bool infrared; int cropDiv; int cropX; int cropY; };
+        QList<Job> jobs;
+        // Grid rows: start one row up when the location sits in the top half
+        // of its tile, clamped to the map's first/last row.
+        const int lastRow = (1 << zoom) - 1;
+        const int topRow = qBound(0, markerY < 0.5 ? tileY - 1 : tileY, lastRow - (kMapRows - 1));
+        const int centerRow = tileY - topRow;
+        const int centerIndex = centerRow * kMapColumns + kMapColumns / 2;
+
+        QList<QStringList> radarPaths, cloudPaths;   // [frame][row * kMapColumns + column]
+        for (int i = 0; i < keep; ++i) {
+            const QString frameId = paths[i].section(QLatin1Char('/'), -1);
+            const qint64 slot = frameTimes[i] - frameTimes[i] % kCloudStepSecs;
+            QStringList radarCols, cloudCols;
+            for (int cell = 0; cell < kMapRows * kMapColumns; ++cell) {
+                const int col = cell % kMapColumns;
+                const int ty = topRow + cell / kMapColumns;
+                const int tx = columnTileX(tileX, col, zoom);
+                const QString rp = QStringLiteral("%1/nws_%2_%3_%4_%5.png")
+                                       .arg(cacheDir, frameId).arg(zoom).arg(tx).arg(ty);
+                radarCols << rp;
+                if (!QFileInfo::exists(rp)) {
+                    const int sub = 1 << radarShift;
+                    jobs.append({QUrl(QStringLiteral("%1%2/%3/%4/%5/%6/%7/%8.png")
+                                          .arg(host, paths[i], QString::number(kRadarTileSize),
+                                               QString::number(radarZoom),
+                                               QString::number(tx >> radarShift),
+                                               QString::number(ty >> radarShift),
+                                               QString::fromLatin1(kRadarColorScheme),
+                                               QString::fromLatin1(kRadarTileOptions))),
+                                  rp, false, sub, tx % sub, ty % sub});
+                }
+                if (!withClouds) continue;
+                const QString cp = QStringLiteral("%1/cloud_%2_%3_%4_%5.png")
+                                       .arg(cacheDir).arg(zoom).arg(tx).arg(ty).arg(slot);
+                cloudCols << cp;
+                const bool queued = std::any_of(jobs.cbegin(), jobs.cend(),
+                                                [&cp](const Job &j) { return j.path == cp; });
+                if (!QFileInfo::exists(cp) && !queued) {
+                    const int sub = 1 << cloudShift;
+                    jobs.append({QUrl(QString::fromLatin1(kCloudTileUrl)
+                                          .arg(QString::fromLatin1(kCloudLayer), iso(slot))
+                                          .arg(cloudZoom).arg(ty >> cloudShift)
+                                          .arg(tx >> cloudShift)),
+                                  cp, true, sub, tx % sub, ty % sub});
+                }
+            }
+            radarPaths << radarCols;
+            cloudPaths << cloudCols;
+        }
+
+        const auto publish = [this, radarPaths, cloudPaths, withClouds, requestGeneration,
+                              zoom, tileX, tileY, markerX, markerY, centerRow, centerIndex]() {
+            if (requestGeneration != m_radarRequestGeneration) return;
+            const auto toUrls = [](const QStringList &cols) {
+                QStringList urls;
+                for (const QString &p : cols)
+                    urls << (QFileInfo::exists(p) ? QUrl::fromLocalFile(p).toString() : QString());
+                return urls;
+            };
+            // GIBS lists a new time slot a few minutes before every tile for it
+            // is actually up (they 404 briefly). Trailing frames whose own
+            // (middle) cloud tile isn't there yet are dropped, same reasoning as
+            // the trim above; they're retried on the next refresh since failures
+            // aren't cached. If that would leave nothing, run without clouds.
+            int last = radarPaths.size();
+            bool clouded = withClouds;
+            if (clouded) {
+                while (last > 0 && !QFileInfo::exists(cloudPaths[last - 1].value(centerIndex)))
+                    --last;
+                if (last == 0) { last = radarPaths.size(); clouded = false; }
+            }
+            // A frame whose own (middle) radar tile never arrived is left out
+            // entirely, clouds included, so the two lists keep the same index.
+            // A cloud tile missing mid-loop reuses the previous frame's tile for
+            // that column, a brief hold instead of the clouds blinking out.
+            QVariantList radar, clouds;
+            QStringList lastCloud(kMapRows * kMapColumns);
+            for (int i = 0; i < last; ++i) {
+                if (!QFileInfo::exists(radarPaths[i].value(centerIndex))) continue;
+                radar.append(QVariant(toUrls(radarPaths[i])));
+                if (!clouded) continue;
+                QStringList urls = toUrls(cloudPaths[i]);
+                for (int col = 0; col < urls.size(); ++col) {
+                    if (urls[col].isEmpty()) urls[col] = lastCloud[col];
+                    else lastCloud[col] = urls[col];
+                }
+                clouds.append(QVariant(urls));
+            }
+            m_radarFrames = radar;
+            m_cloudFrames = clouds;
+            m_radarZoom = zoom;
+            m_radarTileX = tileX;
+            m_radarTileY = tileY;
+            m_radarMarkerX = markerX;
+            m_radarMarkerY = markerY;
+            m_radarCenterRow = centerRow;
+            emit dataChanged();
+        };
+        if (jobs.isEmpty()) { publish(); return; }
+
+        auto pending = std::make_shared<int>(jobs.size());
+        for (const Job &job : jobs) {
+            QNetworkReply *tile = m_nam->get(QNetworkRequest(job.url));
+            connect(tile, &QNetworkReply::finished, this, [tile, job, pending, publish]() {
+                tile->deleteLater();
+                const QByteArray bytes = tile->readAll();
+                QImage img;
+                if (tile->error() != QNetworkReply::NoError || !img.loadFromData(bytes)) {
+                    qWarning("[Weather] %s tile failed: %s", job.infrared ? "cloud" : "radar",
+                             qPrintable(tile->errorString()));
+                } else {
+                    // Radar is decoded first: the upscale below blends colors,
+                    // and blended colors no longer match the palette table.
+                    if (!job.infrared)
+                        img = recolorRadar(img);
+                    if (job.cropDiv > 1) {
+                        const int side = img.width() / job.cropDiv;
+                        img = img.copy(job.cropX * side, job.cropY * side, side, side)
+                                 .scaled(img.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+                    }
+                    if (job.infrared)
+                        img = cloudOverlayFromInfrared(img);
+                    img.save(job.path, "PNG");
+                }
+                if (--*pending == 0) publish();
+            });
+        }
+    });
+}
+
+// Exposed so Radar.qml can project its bundled MapLines.js coastline/border
+// lines into the same tile-local fraction space latLonToTile() already gives
+// markerX/markerY, without duplicating the zoom constant or tile size in QML.
+int WeatherBackend::radarTileSourcePx() const { return kRadarTileSize; }
+int WeatherBackend::radarGridColumns() const { return kMapColumns; }
 
 // ── Station observations ─────────────────────────────────────────────────────
 //

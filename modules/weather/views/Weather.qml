@@ -19,6 +19,7 @@ FocusScope {
     readonly property var allScreens: [
         { id: "current",  source: "screens/CurrentConditions.qml" },
         { id: "extended", source: "screens/ExtendedForecast.qml"  },
+        { id: "radar",    source: "screens/Radar.qml"             },
         { id: "others",   source: "screens/OtherLocations.qml"    },
         { id: "almanac",  source: "screens/Almanac.qml"           }
     ]
@@ -64,6 +65,7 @@ FocusScope {
     // every data update rather than once at startup.
     function screenHasContent(id) {
         if (id === "others") return weatherBackend.hasOtherLocations
+        if (id === "radar")  return weatherBackend.hasRadar
         return true
     }
 
@@ -85,6 +87,13 @@ FocusScope {
             idleTracker.mpvActive = false
             idleTracker.resetActivity()
         }
+    }
+
+    function onRadarScreen() {
+        for (var i = 0; i < allScreens.length; i++)
+            if (allScreens[i].id === "radar")
+                return screens[screenIndex] === allScreens[i].source
+        return false
     }
 
     function advance(step) {
@@ -109,6 +118,15 @@ FocusScope {
             event.accepted = true
         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             weatherRoot.paused = !weatherRoot.paused
+            event.accepted = true
+        } else if ((event.key === Qt.Key_Up || event.key === Qt.Key_Down) && onRadarScreen()) {
+            // Radar screen only: up zooms in, down zooms out, and the zoom is
+            // remembered. Pauses the loop like Left/Right do, since you zoomed
+            // because you wanted to look. Down keeps its music toggle on every
+            // other screen.
+            weatherRoot.paused = true
+            var zoom = weatherBackend.zoomRadar(event.key === Qt.Key_Up ? 1 : -1)
+            appCore.save_setting("com.240mp.weather", "radar_zoom", zoom)
             event.accepted = true
         } else if (event.key === Qt.Key_Down) {
             // Independent of weatherRoot.paused: Enter pauses the carousel, and
@@ -181,11 +199,25 @@ FocusScope {
             if (item.hasOwnProperty("almanac"))      item.almanac = weatherBackend.almanac
             if (item.hasOwnProperty("rows"))         item.rows = weatherBackend.otherLocations
             if (item.hasOwnProperty("tempUnit"))     item.tempUnit = weatherBackend.tempUnitLabel
+            if (item.hasOwnProperty("frames"))       item.frames = weatherBackend.radarFrames
+            if (item.hasOwnProperty("cloudFrames"))  item.cloudFrames = weatherBackend.cloudFrames
+            if (item.hasOwnProperty("markerX"))      item.markerX = weatherBackend.radarMarkerX
+            if (item.hasOwnProperty("markerY"))      item.markerY = weatherBackend.radarMarkerY
+            if (item.hasOwnProperty("tileX"))         item.tileX = weatherBackend.radarTileX
+            if (item.hasOwnProperty("tileY"))         item.tileY = weatherBackend.radarTileY
+            if (item.hasOwnProperty("tileZoom"))      item.tileZoom = weatherBackend.radarZoom
+            if (item.hasOwnProperty("gridColumns"))   item.gridColumns = weatherBackend.radarGridColumns
+            if (item.hasOwnProperty("centerRow"))     item.centerRow = weatherBackend.radarCenterRow
+            if (item.hasOwnProperty("requestedZoom")) item.requestedZoom = weatherBackend.radarRequestedZoom
+            if (item.hasOwnProperty("tileSourcePx"))  item.tileSourcePx = weatherBackend.radarTileSourcePx
         }
     }
 
     Connections {
         target: weatherBackend
+        function onRadarRequestedZoomChanged() {
+            screenLoader.syncScreen()
+        }
         function onDataChanged() {
             weatherRoot.rebuildRing()
             screenLoader.syncScreen()

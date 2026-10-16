@@ -105,6 +105,7 @@ Watch on YouTube: https://youtu.be/r-gylGDoELY
 - Integrates with Open-Meteo to provide weather forecasts for worldwide locations
 - Integrates with NWS to provide current conditions for US locations
 - For your main location it displays Current Conditions and Extended (3-day forecast)
+- Animated radar with satellite cloud cover and map outlines (RainViewer + NASA GIBS, no API key); up/down on the radar screen zooms in and out
 - Can display forecast data for 6 additional locations
 - Supports background music, US/Metric Units and 12-hour/24-hour time display
 
