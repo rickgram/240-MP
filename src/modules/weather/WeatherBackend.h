@@ -5,6 +5,8 @@
 #include <QVariantList>
 #include <QJsonObject>
 #include <QStringList>
+#include <QPointer>
+#include <QNetworkReply>
 #include <functional>
 
 class QNetworkAccessManager;
@@ -172,10 +174,11 @@ private:
     // Downloads every radar tile plus the GOES-East infrared satellite tiles
     // (NASA GIBS, no key) for the same tiles and timestamps, the latter turned
     // into a transparent cloud overlay, then publishes both loops at once.
-    // Cloud failures are non-fatal: the loop just runs without them.
+    // Cloud failures are non-fatal: the loop just runs without them. With
+    // prefetch set it only fills the tile cache (for the neighbouring zooms).
     void buildRadarLoop(const QString &host, const QStringList &paths,
                         const QList<qint64> &frameTimes, int zoom,
-                        quint64 requestGeneration);
+                        quint64 requestGeneration, bool prefetch);
 
     // Station observations (US only). Resolved once per location, then polled
     // alongside fetchWeather(). Every failure here is non-fatal: the module
@@ -220,6 +223,10 @@ private:
     quint64 m_weatherRequestGeneration = 0;
     quint64 m_otherRequestGeneration = 0;
     quint64 m_radarRequestGeneration = 0;
+    // Background zoom prefetches: bumped (and the replies aborted) by every
+    // real fetchRadar(), so a prefetch never holds up a zoom being waited on.
+    quint64 m_radarPrefetchGeneration = 0;
+    QList<QPointer<QNetworkReply>> m_radarPrefetchReplies;
 
     // Resolved location, cached for the life of the process. Deliberately not
     // persisted: the project writes config.json only on direct user

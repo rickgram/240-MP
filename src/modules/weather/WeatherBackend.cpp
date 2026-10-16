@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QHash>
 #include <QImage>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QLocale>
 #include <QTimeZone>
@@ -1151,6 +1152,11 @@ int WeatherBackend::zoomRadar(int step) {
 void WeatherBackend::fetchRadar() {
     if (!m_resolved) return;
     const quint64 requestGeneration = ++m_radarRequestGeneration;
+    // A real fetch always wins over background prefetching (buildRadarLoop).
+    ++m_radarPrefetchGeneration;
+    for (const QPointer<QNetworkReply> &r : std::as_const(m_radarPrefetchReplies))
+        if (r) r->abort();
+    m_radarPrefetchReplies.clear();
     const int zoom = m_radarRequestedZoom;
 
     QNetworkReply *reply = m_nam->get(QNetworkRequest(QUrl(QString::fromLatin1(kRadarMapsUrl))));
@@ -1179,13 +1185,23 @@ void WeatherBackend::fetchRadar() {
             times << static_cast<qint64>(v.toObject()["time"].toDouble());
         }
         if (!paths.isEmpty())
-            buildRadarLoop(host, paths, times, zoom, requestGeneration);
+            buildRadarLoop(host, paths, times, zoom, requestGeneration, false);
     });
 }
 
 void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &paths,
                                     const QList<qint64> &frameTimes, int zoom,
-                                    quint64 requestGeneration) {
+                                    quint64 requestGeneration, bool prefetch) {
+    // A prefetch (the zoom levels either side of the one on screen) only fills
+    // the cache and never publishes. It's dropped as soon as any real fetch
+    // starts (fetchRadar() aborts it), so it never competes with a zoom the
+    // user is actually waiting on.
+    const quint64 prefetchGeneration = m_radarPrefetchGeneration;
+    const auto stale = [this, prefetch, requestGeneration, prefetchGeneration]() {
+        return prefetch ? prefetchGeneration != m_radarPrefetchGeneration
+                        : requestGeneration != m_radarRequestGeneration;
+    };
+
     int tileX = 0, tileY = 0;
     double markerX = 0.5, markerY = 0.5;
     latLonToTile(m_lat, m_lon, zoom, &tileX, &tileY, &markerX, &markerY);
@@ -1214,11 +1230,12 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
                                    iso(frameTimes.first() - 3 * 3600), iso(now + 3600)));
 
     QNetworkReply *reply = m_nam->get(QNetworkRequest(domainsUrl));
+    if (prefetch) m_radarPrefetchReplies << reply;
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, host, paths, frameTimes, zoom, tileX, tileY, markerX, markerY,
-             requestGeneration, cacheDir, iso]() {
+             requestGeneration, prefetch, stale, cacheDir, iso]() {
         reply->deleteLater();
-        if (requestGeneration != m_radarRequestGeneration) return;
+        if (stale()) return;
 
         // <Domain>start/end/PT10M</Domain>, possibly several comma-separated
         // ranges if GIBS has a gap; the end of the last one is the newest frame.
@@ -1265,7 +1282,15 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
         // cropDiv: tiles per parent side (1 = use the tile as-is); cropX/Y:
         // this tile's position within its parent.
         struct Job { QUrl url; QString path; bool infrared; int cropDiv; int cropX; int cropY; };
-        QList<Job> jobs;
+        // Per frame, so the downloads can be queued newest frame first (see
+        // the early publish below).
+        QList<QList<Job>> frameJobs(keep);
+        const auto queued = [&frameJobs](const QString &path) {
+            for (const QList<Job> &fj : frameJobs)
+                for (const Job &j : fj)
+                    if (j.path == path) return true;
+            return false;
+        };
         // Grid rows: start one row up when the location sits in the top half
         // of its tile, clamped to the map's first/last row.
         const int lastRow = (1 << zoom) - 1;
@@ -1287,7 +1312,7 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
                 radarCols << rp;
                 if (!QFileInfo::exists(rp)) {
                     const int sub = 1 << radarShift;
-                    jobs.append({QUrl(QStringLiteral("%1%2/%3/%4/%5/%6/%7/%8.png")
+                    frameJobs[i].append({QUrl(QStringLiteral("%1%2/%3/%4/%5/%6/%7/%8.png")
                                           .arg(host, paths[i], QString::number(kRadarTileSize),
                                                QString::number(radarZoom),
                                                QString::number(tx >> radarShift),
@@ -1300,11 +1325,9 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
                 const QString cp = QStringLiteral("%1/cloud_%2_%3_%4_%5.png")
                                        .arg(cacheDir).arg(zoom).arg(tx).arg(ty).arg(slot);
                 cloudCols << cp;
-                const bool queued = std::any_of(jobs.cbegin(), jobs.cend(),
-                                                [&cp](const Job &j) { return j.path == cp; });
-                if (!QFileInfo::exists(cp) && !queued) {
+                if (!QFileInfo::exists(cp) && !queued(cp)) {
                     const int sub = 1 << cloudShift;
-                    jobs.append({QUrl(QString::fromLatin1(kCloudTileUrl)
+                    frameJobs[i].append({QUrl(QString::fromLatin1(kCloudTileUrl)
                                           .arg(QString::fromLatin1(kCloudLayer), iso(slot))
                                           .arg(cloudZoom).arg(ty >> cloudShift)
                                           .arg(tx >> cloudShift)),
@@ -1315,9 +1338,18 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
             cloudPaths << cloudCols;
         }
 
-        const auto publish = [this, radarPaths, cloudPaths, withClouds, requestGeneration,
-                              zoom, tileX, tileY, markerX, markerY, centerRow, centerIndex]() {
-            if (requestGeneration != m_radarRequestGeneration) return;
+        QList<Job> jobs;
+        for (int i = keep - 1; i >= 0; --i)
+            jobs << frameJobs[i];
+
+        // newestOnly publishes just the newest frame, as soon as it's in: a
+        // zoom to a level that isn't cached yet shows the map right away and
+        // the rest of the loop fills in when it lands, rather than everything
+        // waiting behind the slowest of ~150 downloads.
+        const auto publish = [this, radarPaths, cloudPaths, withClouds, stale,
+                              zoom, tileX, tileY, markerX, markerY, centerRow,
+                              centerIndex](bool newestOnly) {
+            if (stale()) return;
             const auto toUrls = [](const QStringList &cols) {
                 QStringList urls;
                 for (const QString &p : cols)
@@ -1342,7 +1374,7 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
             // that column, a brief hold instead of the clouds blinking out.
             QVariantList radar, clouds;
             QStringList lastCloud(kMapRows * kMapColumns);
-            for (int i = 0; i < last; ++i) {
+            for (int i = newestOnly ? last - 1 : 0; i < last; ++i) {
                 if (!QFileInfo::exists(radarPaths[i].value(centerIndex))) continue;
                 radar.append(QVariant(toUrls(radarPaths[i])));
                 if (!clouded) continue;
@@ -1363,16 +1395,37 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
             m_radarCenterRow = centerRow;
             emit dataChanged();
         };
-        if (jobs.isEmpty()) { publish(); return; }
+
+        // Once the loop on screen is complete, warm the cache one zoom level
+        // either side, so the next Up/Down press finds its tiles already there.
+        const auto finish = [this, publish, prefetch, stale, host, paths, frameTimes,
+                             zoom, requestGeneration]() {
+            if (prefetch || stale()) return;
+            publish(false);
+            for (int z : { zoom + 1, zoom - 1 })
+                if (z >= kRadarMinZoom && z <= kRadarMaxZoom)
+                    buildRadarLoop(host, paths, frameTimes, z, requestGeneration, true);
+        };
+        if (jobs.isEmpty()) { finish(); return; }
+
+        // Only worth it when the zoom on screen is about to change (or nothing
+        // is on screen yet); a refresh at the same zoom keeps the old loop up.
+        const bool earlyWanted = !prefetch && (zoom != m_radarZoom || m_radarFrames.isEmpty());
+        const QStringList newestTiles = radarPaths.last() + cloudPaths.last();
+        auto earlyDone = std::make_shared<bool>(!earlyWanted);
 
         auto pending = std::make_shared<int>(jobs.size());
         for (const Job &job : jobs) {
             QNetworkReply *tile = m_nam->get(QNetworkRequest(job.url));
-            connect(tile, &QNetworkReply::finished, this, [tile, job, pending, publish]() {
+            if (prefetch) m_radarPrefetchReplies << tile;
+            connect(tile, &QNetworkReply::finished, this,
+                    [tile, job, pending, publish, finish, newestTiles, earlyDone]() {
                 tile->deleteLater();
                 const QByteArray bytes = tile->readAll();
                 QImage img;
-                if (tile->error() != QNetworkReply::NoError || !img.loadFromData(bytes)) {
+                if (tile->error() == QNetworkReply::OperationCanceledError) {
+                    // An aborted prefetch; nothing to report.
+                } else if (tile->error() != QNetworkReply::NoError || !img.loadFromData(bytes)) {
                     qWarning("[Weather] %s tile failed: %s", job.infrared ? "cloud" : "radar",
                              qPrintable(tile->errorString()));
                 } else {
@@ -1389,7 +1442,14 @@ void WeatherBackend::buildRadarLoop(const QString &host, const QStringList &path
                         img = cloudOverlayFromInfrared(img);
                     img.save(job.path, "PNG");
                 }
-                if (--*pending == 0) publish();
+                if (--*pending == 0) {
+                    finish();
+                } else if (!*earlyDone
+                           && std::all_of(newestTiles.cbegin(), newestTiles.cend(),
+                                          [](const QString &p) { return QFileInfo::exists(p); })) {
+                    *earlyDone = true;
+                    publish(true);
+                }
             });
         }
     });
