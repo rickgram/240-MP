@@ -36,6 +36,10 @@ const char *kNwsUserAgent = "240-MP/" APP_VERSION " (https://github.com/anthonyc
 // Open-Meteo publishes data roughly every 15 minutes.
 constexpr int kRefreshMs = 10 * 60 * 1000;
 
+// Matches VOLUME_STEP in scripts/mpv-media-keys.lua, the video-playback
+// equivalent this mirrors.
+constexpr int kMusicVolumeStep = 5;
+
 // Played when the user has no weather_music.txt, so the module sounds right
 // with zero setup. Written the way a user would write them — spaces and all —
 // because musicPlaylist() applies the same encoding rule to both sources.
@@ -667,6 +671,24 @@ void WeatherBackend::toggleMusic() {
     };
     m_musicIpc->write(QJsonDocument(cmd).toJson(QJsonDocument::Compact) + "\n");
     emit musicStateChanged();
+}
+
+void WeatherBackend::sendKey(const QString &key) {
+    if (!m_music || m_music->state() == QProcess::NotRunning) return;
+    if (!m_musicIpc || m_musicIpc->state() != QLocalSocket::ConnectedState) return;
+
+    QJsonArray command;
+    if (key == QStringLiteral("VOLUME_UP"))
+        command = { QStringLiteral("add"), QStringLiteral("volume"), kMusicVolumeStep };
+    else if (key == QStringLiteral("VOLUME_DOWN"))
+        command = { QStringLiteral("add"), QStringLiteral("volume"), -kMusicVolumeStep };
+    else if (key == QStringLiteral("MUTE"))
+        command = { QStringLiteral("cycle"), QStringLiteral("mute") };
+    else
+        return;
+
+    const QJsonObject cmd{ { QStringLiteral("command"), command } };
+    m_musicIpc->write(QJsonDocument(cmd).toJson(QJsonDocument::Compact) + "\n");
 }
 
 // ── Location ─────────────────────────────────────────────────────────────────

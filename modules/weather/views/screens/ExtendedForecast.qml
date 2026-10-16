@@ -5,7 +5,7 @@ import QtQuick.Effects
 //
 // Condition text wraps to a second line on its own (SHOWERS / T'STORMS in the
 // original), which is why each column is a fixed-width Column rather than a row
-// of single labels — the LO/HI block has to stay aligned across columns even
+// of single labels — the HI/LO block has to stay aligned across columns even
 // when one condition wraps and the others don't. The icon is anchored the same
 // way and for the same reason.
 Item {
@@ -71,7 +71,7 @@ Item {
                     }
                 }
 
-                // Anchored above LO/HI rather than centred in the gap below the
+                // Anchored above HI/LO rather than centred in the gap below the
                 // condition: PARTLY CLOUDY wraps to two lines where RAIN does
                 // not, so that gap differs per column and centring in it would
                 // leave the three icons at different heights.
@@ -103,7 +103,7 @@ Item {
                 }
 
                 // Anchored to the bottom of the column rather than flowing after
-                // the condition, so LO/HI line up across all three days
+                // the condition, so HI/LO line up across all three days
                 // regardless of how many lines the condition took.
                 //
                 // Centred as a *block*: the Column takes the width of its wider
@@ -117,13 +117,13 @@ Item {
                     spacing: root.sh * 0.0138021 //6.625
 
                     Text {
-                        text: "LO: " + (modelData.lo || "")
+                        text: "HI: " + (modelData.hi || "")
                         color: root.primaryColor
                         font.family: root.globalFont
                         font.pixelSize: screen.lineSize
                     }
                     Text {
-                        text: "HI: " + (modelData.hi || "")
+                        text: "LO: " + (modelData.lo || "")
                         color: root.primaryColor
                         font.family: root.globalFont
                         font.pixelSize: screen.lineSize

@@ -169,9 +169,16 @@ int main(int argc, char *argv[]) {
     mpvController.setTargetDisplay(displayIndex, targetScreen ? targetScreen->name() : QString());
 
     // When the Qt window is inactive (fullscreen mpv has OS focus on macOS),
-    // gamepad actions bypass QML and drive mpv directly over IPC.
+    // gamepad actions bypass QML and drive mpv directly over IPC. Dispatched to
+    // both mpv-backed players unconditionally — MpvController::sendKey and
+    // WeatherBackend::sendKey each no-op on their own when their own process
+    // isn't the one running, and video playback and the weather module's
+    // background music are never both active at once, so at most one of the
+    // two ever does anything with a given key.
     QObject::connect(&inputManager, &InputManager::mpvKeyRequested,
                      &mpvController, &MpvController::sendKey);
+    QObject::connect(&inputManager, &InputManager::mpvKeyRequested,
+                     &weatherBackend, &WeatherBackend::sendKey);
 
     // Each module backend is wired in one call: stored for action routing, exposed to QML
     // under its context-property name, and its optional signals/slots connected by

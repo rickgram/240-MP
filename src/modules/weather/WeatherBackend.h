@@ -85,6 +85,15 @@ public:
     // the toggle. Session-only: it deliberately does not write the setting.
     Q_INVOKABLE void toggleMusic();
 
+    // Volume/mute for the background music, driven by the same HID media keys
+    // as video playback (see main.cpp's InputManager::mpvKeyRequested wiring).
+    // Music runs its own bare mpv process with no mpv-media-keys.lua loaded (no
+    // video surface for its OSD, and that script's STOP/PLAYPAUSE bindings would
+    // fight toggleMusic()'s own pause bookkeeping) — so VOLUME_UP/VOLUME_DOWN/
+    // MUTE are handled directly here as plain property commands instead. A
+    // no-op key, or a call while music isn't playing, does nothing.
+    Q_INVOKABLE void sendKey(const QString &key);
+
     // options_slot for the "displays" multiselect. Ids match Weather.qml's
     // allScreens list.
     Q_INVOKABLE void getDisplays();

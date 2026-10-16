@@ -36,7 +36,7 @@
       "key": "screen_time",
       "label": "Screen Time",
       "type": "list_single",
-      "options": ["10 SEC", "30 SEC", "60 SEC"],
+      "options": ["10 SEC", "20 SEC", "30 SEC", "60 SEC"],
       "default": "10 SEC",
       "description": "How long each screen stays up before the loop advances"
     },
