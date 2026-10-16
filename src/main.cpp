@@ -68,6 +68,25 @@ static QString resolveDataRoot() {
 //
 // Async-signal-safe: only sets a flag. A 100 ms timer in main() polls it and calls
 // quit() from the event loop, where destructors run properly.
+// Dev preview window (macOS only): MP240_WINDOW=1 (960x720) or MP240_WINDOW=WxH.
+// Instead of covering the display, the app opens as a normal movable window and
+// lays itself out on a fixed 720x480 stage (the Pi's NTSC composite frame),
+// stretched to fill the window. With a 4:3 window that reproduces the CRT's
+// non-square pixels, so layout tweaks look the way they will on the Pi.
+// Returns an empty size when unset.
+static QSize devWindowSize() {
+    const QByteArray env = qgetenv("MP240_WINDOW").trimmed();
+    if (env.isEmpty() || env == "0")
+        return QSize();
+    const QList<QByteArray> parts = env.toLower().split('x');
+    if (parts.size() == 2) {
+        const int w = parts[0].toInt(), h = parts[1].toInt();
+        if (w > 0 && h > 0)
+            return QSize(w, h);
+    }
+    return QSize(960, 720);
+}
+
 static volatile std::sig_atomic_t g_termRequested = 0;
 extern "C" void mp240HandleTerm(int) { g_termRequested = 1; }
 
@@ -83,8 +102,13 @@ int main(int argc, char *argv[]) {
     QGuiApplication::setOverrideCursor(Qt::BlankCursor);
 #endif
 #ifdef Q_OS_MAC
-    QGuiApplication::setOverrideCursor(Qt::BlankCursor);
-    hideMacOSMenuBar();
+    const QSize devWindow = devWindowSize();
+    if (devWindow.isEmpty()) {
+        QGuiApplication::setOverrideCursor(Qt::BlankCursor);
+        hideMacOSMenuBar();
+    }
+#else
+    const QSize devWindow;
 #endif
 
     setlocale(LC_NUMERIC, "C");
@@ -192,16 +216,28 @@ int main(int argc, char *argv[]) {
     ctx->setContextProperty("mpvController", &mpvController);
     ctx->setContextProperty("inputManager",  &inputManager);
     ctx->setContextProperty("updateManager", &updateManager);
+    // Dev preview stage (see devWindowSize). Set on every platform so Main.qml
+    // can read them unconditionally; devWindowed is only ever true on macOS.
+    ctx->setContextProperty("devWindowed",    QVariant(!devWindow.isEmpty()));
+    ctx->setContextProperty("devStageWidth",  QVariant(720));
+    ctx->setContextProperty("devStageHeight", QVariant(480));
 #ifdef Q_OS_MAC
+    // Windowed dev preview: a normal window centered on the target display
+    // instead of the full display frame.
+    const QRect windowGeo = devWindow.isEmpty()
+        ? screenGeo
+        : QRect(QPoint(screenGeo.center().x() - devWindow.width() / 2,
+                       screenGeo.center().y() - devWindow.height() / 2),
+                devWindow);
     // Target display geometry in Qt coordinates (top-left origin), so the QML
     // Window bindings position onto the chosen screen. The native fullscreen
     // call after load then nails the exact frame in AppKit coordinates.
     // QVariant(...) not a literal — a bare 0 is a null pointer constant and
     // resolves to the QObject* overload, handing QML null instead of an int.
-    engine.rootContext()->setContextProperty("macScreenX",      QVariant(screenGeo.x()));
-    engine.rootContext()->setContextProperty("macScreenY",      QVariant(screenGeo.y()));
-    engine.rootContext()->setContextProperty("macScreenWidth",  QVariant(screenGeo.width()));
-    engine.rootContext()->setContextProperty("macScreenHeight", QVariant(screenGeo.height()));
+    engine.rootContext()->setContextProperty("macScreenX",      QVariant(windowGeo.x()));
+    engine.rootContext()->setContextProperty("macScreenY",      QVariant(windowGeo.y()));
+    engine.rootContext()->setContextProperty("macScreenWidth",  QVariant(windowGeo.width()));
+    engine.rootContext()->setContextProperty("macScreenHeight", QVariant(windowGeo.height()));
 #endif
 
     engine.addImportPath(appRoot + "/views");
@@ -222,9 +258,10 @@ int main(int argc, char *argv[]) {
         // both Qt's and AppKit's notion of the window's screen agree.
         if (targetScreen)
             win->setScreen(targetScreen);
-        win->setGeometry(screenGeo);
+        win->setGeometry(windowGeo);
         win->winId(); // ensure native NSWindow is created
-        forceWindowFullScreenOnScreen(reinterpret_cast<void *>(win->winId()), displayIndex);
+        if (devWindow.isEmpty())
+            forceWindowFullScreenOnScreen(reinterpret_cast<void *>(win->winId()), displayIndex);
     }
 #elif defined(Q_OS_LINUX)
     // Desktop Linux (Steam Deck desktop mode, generic x86_64) only: EGLFS has

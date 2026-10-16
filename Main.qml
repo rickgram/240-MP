@@ -3,7 +3,9 @@ import QtQuick.Window
 
 Window {
     id: root
-    flags: Qt.FramelessWindowHint | Qt.Window
+    // The dev preview window (MP240_WINDOW, macOS) keeps its title bar so it
+    // can be moved around the desktop.
+    flags: devWindowed ? Qt.Window : (Qt.FramelessWindowHint | Qt.Window)
     x:      Qt.platform.os === "osx" ? macScreenX      : Screen.virtualX
     y:      Qt.platform.os === "osx" ? macScreenY      : Screen.virtualY
     width:  Qt.platform.os === "osx" ? macScreenWidth  : Screen.width
@@ -88,8 +90,20 @@ Window {
     property string surfaceColor:   (allThemes[currentTheme] || allThemes["Video 1"]).surface
     property string accentColor:    (allThemes[currentTheme] || allThemes["Video 1"]).accent
 
-    readonly property real sw: width
-    readonly property real sh: height
+    // In the dev preview window everything lays out on the Pi's 720x480 stage
+    // and `stage` stretches it to the window, see main.cpp devWindowSize.
+    readonly property real sw: devWindowed ? devStageWidth  : width
+    readonly property real sh: devWindowed ? devStageHeight : height
+
+    Item {
+        id: stage
+        width: root.sw
+        height: root.sh
+        transform: Scale {
+            xScale: root.width  / root.sw
+            yScale: root.height / root.sh
+        }
+    }
 
     Connections {
         target: appCore
@@ -237,6 +251,7 @@ Window {
     // --- MODULE LOADER ---
     Loader {
         id: moduleLoader;
+        parent: stage
         anchors.fill: parent;
         focus: true;
         source: "views/ModuleList.qml";
@@ -307,6 +322,7 @@ Window {
 
     Item {
         id: screenSaverOverlay
+        parent: stage
         anchors.fill: parent
         visible: screenSaverActive
         z: 9999
