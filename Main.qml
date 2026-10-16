@@ -200,6 +200,22 @@ Window {
     property var appCurrentParams: ({})
     property bool _startupNavigated: false
 
+    // Remote/gamepad Home button (InputManager Action::Home, default key
+    // Qt.Key_Home; see Settings > Remote Controls to bind a physical button
+    // to it). Drops the whole app-level nav stack and jumps straight back to
+    // the root module list from anywhere, including mid-video: Player.qml key
+    // handlers only whitelist specific keys and leave Key_Home unaccepted, so
+    // it bubbles up the item hierarchy to this handler untouched. A no-op
+    // when already home, so it can't retrigger the startup entry-point logic
+    // in moduleLoader.onLoaded.
+    function goHome() {
+        if (root.appNavStack.length === 0 && moduleLoader.source == "views/ModuleList.qml")
+            return
+        root.appNavStack = []
+        root.appCurrentParams = {}
+        moduleLoader.setSource("views/ModuleList.qml", { "navParams": {} })
+    }
+
     // --- MPV PLAYBACK TRACKING ---
     // Block the screen saver while mpv is playing so it never flashes during or
     // immediately after playback. The core guard is in IdleTracker (mpvActive
@@ -244,6 +260,9 @@ Window {
         Keys.onPressed: (event) => {
             if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Q) {
                 Qt.quit()
+            } else if (event.key === Qt.Key_Home) {
+                root.goHome()
+                event.accepted = true
             }
         }
 

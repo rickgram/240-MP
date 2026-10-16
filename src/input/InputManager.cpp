@@ -38,6 +38,17 @@ constexpr int kEvdevKeyBase = 0x02000000;
 // key, so it never generates a QKeyEvent at all. Distinct base, same QHash.
 constexpr int kMouseButtonBase = 0x03000000;
 
+// Same idea again, for a keyboard-path key Qt could not translate to any
+// Qt::Key at all (reported as key() == 0 or Qt::Key_unknown). Some remote
+// dongles send a HID usage code with no entry in the platform's keymap —
+// Qt still delivers the press (and still fills in nativeScanCode()), it just
+// can't name it. Falling back to the raw scan code here means such a button
+// is still capturable/bindable instead of silently vanishing into an id of 0,
+// which previously got saved as if it meant "no custom key," quietly wiping
+// out any real binding a capture had just set. Highest base of the four
+// (checked first in keyDisplayName) since it's the last-resort fallback.
+constexpr int kNativeScanCodeBase = 0x04000000;
+
 // Analog stick thresholds (of ±32768). Engage above one, release below the
 // other — the gap prevents flutter when the stick rests near the threshold.
 constexpr Sint16 kAxisEngage  = 16384;
@@ -231,6 +242,7 @@ void InputManager::loadDefaultMapping() {
     m_buttonMap[SDL_CONTROLLER_BUTTON_B]             = Action::Back;
     m_buttonMap[SDL_CONTROLLER_BUTTON_BACK]          = Action::Back;
     m_buttonMap[SDL_CONTROLLER_BUTTON_START]         = Action::PlayPause;
+    m_buttonMap[SDL_CONTROLLER_BUTTON_GUIDE]         = Action::Home;
     m_buttonMap[SDL_CONTROLLER_BUTTON_LEFTSHOULDER]  = Action::Left;
     m_buttonMap[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] = Action::Right;
     m_axisMap[SDL_CONTROLLER_AXIS_LEFTX] = { Action::Left, Action::Right };
@@ -246,6 +258,7 @@ InputManager::Action InputManager::actionFromString(const QString &name, bool *o
     if (name == "select")     return Action::Select;
     if (name == "back")       return Action::Back;
     if (name == "play_pause" || name == "playpause") return Action::PlayPause;
+    if (name == "home")       return Action::Home;
     if (name == "none")       return Action::None;
     *ok = false;
     return Action::None;
@@ -722,6 +735,7 @@ int InputManager::qtKeyForAction(Action a) {
     case Action::Select:    return Qt::Key_Return;
     case Action::Back:      return Qt::Key_Escape;
     case Action::PlayPause: return Qt::Key_Space;
+    case Action::Home:      return Qt::Key_Home;
     case Action::None:      break;
     }
     return 0;
@@ -737,6 +751,9 @@ QString InputManager::mpvKeyForAction(Action a) {
     case Action::Select:    return QStringLiteral("ENTER");
     case Action::Back:      return QStringLiteral("ESC");
     case Action::PlayPause: return QStringLiteral("SPACE");
+    // Home never reaches mpv; Main.qml intercepts it globally to jump to the
+    // home screen before any Player view's key forwarding sees it.
+    case Action::Home:      return QString();
     case Action::None:      break;
     }
     return QString();
@@ -749,6 +766,8 @@ bool InputManager::isDirectional(Action a) {
 QString InputManager::keyDisplayName(int qtKey) const {
     if (qtKey == 0)
         return QString();
+    if (qtKey >= kNativeScanCodeBase)
+        return QStringLiteral("Button %1").arg(qtKey - kNativeScanCodeBase);
     if (qtKey >= kMouseButtonBase)
         return mouseButtonName(qtKey - kMouseButtonBase);
     if (qtKey >= kEvdevKeyBase)
@@ -864,8 +883,13 @@ bool InputManager::eventFilter(QObject *obj, QEvent *event) {
     // key. Sits after the right-shift block so that alias still cancels the
     // overlay via its normal Back path.
     if (m_remapCapture && !synthetic) {
-        if (type == QEvent::KeyPress && !ke->isAutoRepeat())
-            emit auxButtonPressed(ke->key());
+        if (type == QEvent::KeyPress && !ke->isAutoRepeat()) {
+            const int key = ke->key();
+            emit auxButtonPressed(
+                (key == 0 || key == Qt::Key_unknown)
+                    ? kNativeScanCodeBase + int(ke->nativeScanCode())
+                    : key);
+        }
         return true;
     }
 
@@ -881,7 +905,11 @@ bool InputManager::eventFilter(QObject *obj, QEvent *event) {
     // (the hash miss is checked first — it's cheap, while textInputHasFocus
     // is a synchronous input-method query and shouldn't run per keystroke).
     if (!synthetic) {
-        const Action remapped = m_keyRemap.value(ke->key(), Action::None);
+        const int key = ke->key();
+        const int lookupId = (key == 0 || key == Qt::Key_unknown)
+            ? kNativeScanCodeBase + int(ke->nativeScanCode())
+            : key;
+        const Action remapped = m_keyRemap.value(lookupId, Action::None);
         if (remapped != Action::None && !textInputHasFocus()) {
             if (type == QEvent::KeyPress)
                 deliverPress(remapped, ke->isAutoRepeat());

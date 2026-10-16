@@ -23,7 +23,8 @@ FocusScope {
         { id: "left",   label: "Left" },
         { id: "right",  label: "Right" },
         { id: "select", label: "Select / OK" },
-        { id: "back",   label: "Back" }
+        { id: "back",   label: "Back" },
+        { id: "home",   label: "Home" }
     ]
 
     property var rows: []

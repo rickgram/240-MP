@@ -325,7 +325,7 @@ All input arrives in QML as **ordinary key events** — views bind `Keys.onPress
 ### How it works
 
 1. **SDL2 GameController** — `SDL_Init(SDL_INIT_GAMECONTROLLER)` only (no video subsystem, so it works headless under EGLFS). A 16 ms `QTimer` on the main thread polls SDL events: hotplug (`CONTROLLERDEVICEADDED/REMOVED`), buttons, and axes. SDL's built-in controller database normalizes most pads to a standard layout, so defaults "should" work out of the box. The `SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS` hint keeps controller input flowing while mpv's window holds OS focus during playback.
-2. **Buttons → actions → key events** — each SDL input maps to one of seven named actions below, and each action synthesizes one Qt key. Button identities are **positional** (using an Xbox reference layout — `SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS` is forced off so Nintendo-type pads behave the same): `a` is always the south face button and input.cfg accepts `south`/`east`/`west`/`north` aliases to try to make it easier to wrap my head around =)
+2. **Buttons → actions → key events** — each SDL input maps to one of eight named actions below, and each action synthesizes one Qt key. Button identities are **positional** (using an Xbox reference layout — `SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS` is forced off so Nintendo-type pads behave the same): `a` is always the south face button and input.cfg accepts `south`/`east`/`west`/`north` aliases to try to make it easier to wrap my head around =)
 
    | Action | Qt key | Default binding |
    |---|---|---|
@@ -333,6 +333,9 @@ All input arrives in QML as **ordinary key events** — views bind `Keys.onPress
    | `select` | Return | A |
    | `back` | Escape/Backspace | B, Select |
    | `play_pause` | Space | Start |
+   | `home` | Home | Guide |
+
+   `home` is handled entirely at the QML level rather than forwarded to mpv: `Main.qml` catches `Qt.Key_Home` on the module Loader and resets the whole app-level nav stack back to `views/ModuleList.qml`, from anywhere. Player views only whitelist the specific keys they forward to mpv, so an unrecognized key like Home is left unaccepted and bubbles up the item hierarchy to that handler untouched, mid-video included. Bind a remote's physical Home/menu button to it the same way the OK button gets bound to `select` on a remote InputManager can't natively translate: Settings → Remote Controls → Home → press the button.
 
 3. **Delivery** — while the Qt window is **active**, synthesized `QKeyEvent`s are posted to the root QQuickWindow and reach the QML `activeFocusItem` like real key presses; on RPi/EGLFS the window is always active, so during playback they flow through the Player views' existing key forwarding (`mpvController.sendKey(...)`). When the window is **inactive** (like on MacOS where fullscreen mpv holds OS focus) and QQuickWindow has no `activeFocusItem`; `InputManager` instead emits `mpvKeyRequested(key)`, which `main.cpp` connects to `MpvController::sendKey`.  That will drive mpv directly over IPC with the same key names. The net result is that gamepads drive mpv identically to the keyboard on both platforms. Held directions auto-repeat (400 ms delay, 100 ms interval) so lists and ff/rw feel like keyboard repeat.
 4. **User overrides** — `$DATA_ROOT/input.cfg` (`<input> <action>` per line, `#` comments, merged over defaults, live-reloaded via `QFileSystemWatcher`). An optional `$DATA_ROOT/gamecontrollerdb.txt` can add SDL mappings for exotic pads. Check out grammar and examples in [BUILDING.md → Gamepad input](BUILDING.md#gamepad-input-inputcfg).
